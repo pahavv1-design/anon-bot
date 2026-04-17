@@ -6,34 +6,15 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# 1. Настройка логирования (чтобы видеть ошибки в логах Bothost)
+# Настройка логов для Bothost
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# 2. Получение переменных
+# Переменные
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID")
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/telegram")
-
-# Безопасная конвертация ID
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else None
-except ValueError:
-    logger.error("ОШИБКА: ADMIN_ID должен быть числом!")
-    ADMIN_ID = None
-
-try:
-    CHANNEL_ID = int(CHANNEL_ID_RAW) if CHANNEL_ID_RAW else None
-except ValueError:
-    logger.error("ОШИБКА: CHANNEL_ID должен быть числом (начинается с -100)!")
-    CHANNEL_ID = None
-
-if not TOKEN:
-    logger.error("ОШИБКА: BOT_TOKEN не найден в переменных Bothost!")
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW and ADMIN_ID_RAW.isdigit() else None
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -50,7 +31,6 @@ def init_db():
     cursor.execute('CREATE TABLE IF NOT EXISTS messages (msg_key TEXT PRIMARY KEY, s_id INTEGER, r_id INTEGER, s_mid INTEGER, r_mid INTEGER)')
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована.")
 
 def db_query(query, params=(), fetchone=False, fetchall=False):
     conn = sqlite3.connect("bot_data.db")
@@ -63,141 +43,131 @@ def db_query(query, params=(), fetchone=False, fetchall=False):
     conn.close()
     return res
 
-# --- ЛОГИКА РЕЙТИНГА (БЕЗ ЛИМИТОВ) ---
-def get_user_rank(user_id):
-    res = db_query('''
-        SELECT COUNT(*) + 1 FROM users 
-        WHERE received > (SELECT received FROM users WHERE user_id = ?)
-    ''', (user_id,), fetchone=True)
-    return res[0] if res else 1
-
-# --- ПРОВЕРКА ПОДПИСКИ ---
-async def check_sub(user_id):
-    if not CHANNEL_ID: return True
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except Exception as e:
-        logger.warning(f"Ошибка проверки подписки: {e}")
-        return True
-
-# --- КЛАВИАТУРА ---
-def main_kb(user_id):
+# --- ОБЫЧНОЕ МЕНЮ (КНОПКИ ВНИЗУ) ---
+def get_main_kb(user_id):
     buttons = [
-        [KeyboardButton(text="🔗 Моя ссылка"), KeyboardButton(text="📊 Статистика")]
+        [KeyboardButton(text="🔗 Моя ссылка"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="💡 Идея")]
     ]
     if user_id == ADMIN_ID:
-        buttons.append([KeyboardButton(text="📢 Админ-панель")])
+        buttons.append([KeyboardButton(text="📢 Рассылка")])
+    
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# --- ОБРАБОТЧИКИ ---
+# --- ОБРАБОТЧИКИ КОМАНД ---
 
 @dp.message(CommandStart())
-async def start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("user"):
         target_id = int(args[1].replace("user", ""))
-        if not await check_sub(user_id):
-            kb = InlineKeyboardBuilder()
-            kb.row(InlineKeyboardButton(text="Подписаться", url=CHANNEL_URL))
-            return await message.answer(f"❌ Чтобы отправить сообщение, подпишись на канал!", reply_markup=kb.as_markup())
-        if target_id == user_id: return await message.answer("Нельзя писать самому себе.")
+        if target_id == user_id:
+            return await message.answer("Нельзя писать самому себе!")
         
         db_query("UPDATE users SET clicks = clicks + 1 WHERE user_id = ?", (target_id,))
         await state.update_data(target_id=target_id)
         await state.set_state(States.writing_msg)
-        return await message.answer("🤫 Напиши анонимное сообщение:")
+        return await message.answer("🤫 Напиши анонимное сообщение для пользователя:", reply_markup=types.ReplyKeyboardRemove())
 
     bot_info = await bot.get_me()
     link = f"t.me/{bot_info.username}?start=user{user_id}"
-    await message.answer(f"<b>Твоя ссылка для сообщений:</b>\n<code>{link}</code>", parse_mode="HTML", reply_markup=main_kb(user_id))
+    await message.answer(f"🚀 <b>Твоя ссылка:</b>\n<code>{link}</code>", parse_mode="HTML", reply_markup=get_main_kb(user_id))
 
 @dp.message(F.text == "📊 Статистика")
 @dp.message(Command("mystats"))
-async def stats(message: types.Message):
+async def cmd_stats(message: types.Message):
     user_id = message.from_user.id
     res = db_query("SELECT clicks, received FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     clicks, received = res if res else (0, 0)
-    rank = get_user_rank(user_id)
+    
+    # Расчет места в рейтинге
+    rank_res = db_query("SELECT COUNT(*) + 1 FROM users WHERE received > (SELECT received FROM users WHERE user_id = ?)", (user_id,), fetchone=True)
+    rank = rank_res[0] if rank_res else 1
+
     text = (
-        "📌 <b>Статистика профиля</b>\n\n"
-        f"💬 Получено сообщений: {received}\n"
+        "📌 <b>Статистика</b>\n\n"
+        f"💬 Сообщений получено: {received}\n"
         f"👀 Переходов по ссылке: {clicks}\n"
-        f"⭐ Твое место в рейтинге: {rank}\n"
+        f"⭐ Место в рейтинге: {rank}"
     )
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(Command("url"))
 @dp.message(F.text == "🔗 Моя ссылка")
+@dp.message(Command("url"))
 async def cmd_url(message: types.Message):
     bot_info = await bot.get_me()
     link = f"t.me/{bot_info.username}?start=user{message.from_user.id}"
-    await message.answer(f"🔗 Твоя ссылка:\n<code>{link}</code>", parse_mode="HTML")
+    await message.answer(f"Твоя ссылка для анонимных сообщений:\n<code>{link}</code>", parse_mode="HTML")
 
+@dp.message(F.text == "🌐 Язык")
 @dp.message(Command("lang"))
 async def cmd_lang(message: types.Message):
-    await message.answer("🇷🇺 Язык: Русский")
+    await message.answer("🇷🇺 Текущий язык: <b>Русский</b>", parse_mode="HTML")
 
+@dp.message(F.text == "💡 Идея")
 @dp.message(Command("issue"))
 async def cmd_issue(message: types.Message):
-    await message.answer("💡 Пишите ваши предложения прямо в чат админу: @ваш_юзернейм")
+    await message.answer("Если у вас есть идеи или проблемы, пишите админу: @ваш_ник")
 
 # --- ОТПРАВКА И УДАЛЕНИЕ ---
 @dp.message(States.writing_msg)
-async def process_msg(message: types.Message, state: FSMContext):
+async def process_anon_msg(message: types.Message, state: FSMContext):
     data = await state.get_data()
     t_id = data['target_id']
     s_id = message.from_user.id
     
     try:
+        # Отправка получателю
         r_msg = await bot.send_message(t_id, f"🎁 <b>Новое анонимное сообщение:</b>\n\n{message.text}", parse_mode="HTML")
-        if ADMIN_ID:
-            await bot.send_message(ADMIN_ID, f"🕵️ <b>ЛОГ:</b>\nОт: {s_id}\nКому: {t_id}\nТекст: {message.text}")
-
-        msg_key = f"del_{r_msg.message_id}"
-        kb = InlineKeyboardBuilder()
-        kb.row(InlineKeyboardButton(text="🗑 Удалить у всех", callback_data=msg_key))
-        s_msg = await message.answer("✅ Отправлено!", reply_markup=kb.as_markup())
         
+        # Кнопка удаления для отправителя
+        msg_key = f"del_{r_msg.message_id}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить сообщение", callback_data=msg_key)]])
+        
+        s_msg = await message.answer("✅ Отправлено!", reply_markup=kb)
+        
+        # Сохраняем для удаления
         db_query("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", (msg_key, s_id, t_id, s_msg.message_id, r_msg.message_id))
         db_query("UPDATE users SET received = received + 1 WHERE user_id = ?", (t_id,))
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        
+        # Лог админу
+        if ADMIN_ID:
+            await bot.send_message(ADMIN_ID, f"🕵️ <b>ЛОГ:</b>\nОт: {s_id}\nКому: {t_id}\nТекст: {message.text}")
+            
+    except:
         await message.answer("❌ Ошибка отправки.")
+    
     await state.clear()
+    await cmd_start(message, state) # Возвращаем меню
 
 @dp.callback_query(F.data.startswith("del_"))
-async def delete_sync(call: types.CallbackQuery):
+async def on_delete(call: types.CallbackQuery):
     data = db_query("SELECT * FROM messages WHERE msg_key = ?", (call.data,), fetchone=True)
     if data:
         try:
             await bot.delete_message(data[2], data[4]) # у получателя
-            await bot.delete_message(data[1], data[3]) # у отправителя
-            await call.answer("Удалено.")
-        except: pass
+            await bot.delete_message(data[1], data[3]) # сообщение "Отправлено"
+            await call.answer("Сообщение удалено.")
+        except:
+            await call.answer("Ошибка при удалении.")
         db_query("DELETE FROM messages WHERE msg_key = ?", (call.data,))
     else:
         await call.answer("Уже удалено.")
 
-@dp.message(F.text == "📢 Админ-панель")
-async def admin_menu(message: types.Message):
+# --- РАССЫЛКА ДЛЯ АДМИНА ---
+@dp.message(F.text == "📢 Рассылка")
+async def start_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="🚀 Рассылка", callback_data="start_broadcast"))
-    await message.answer("Админка:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data == "start_broadcast")
-async def broadcast_step1(call: types.CallbackQuery, state: FSMContext):
+    await message.answer("Введите текст рассылки:")
     await state.set_state(States.broadcasting)
-    await call.message.answer("Введите текст рассылки:")
 
 @dp.message(States.broadcasting)
-async def broadcast_step2(message: types.Message, state: FSMContext):
+async def do_broadcast(message: types.Message, state: FSMContext):
     users = db_query("SELECT user_id FROM users", fetchall=True)
-    await message.answer(f"🚀 Рассылка на {len(users)} чел. запущена...")
+    await message.answer(f"Рассылка на {len(users)} пользователей...")
     for user in users:
         try:
             await bot.send_message(user[0], message.text)
@@ -208,11 +178,7 @@ async def broadcast_step2(message: types.Message, state: FSMContext):
 
 async def main():
     init_db()
-    logger.info("Бот запускается...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
+    asyncio.run(main())
